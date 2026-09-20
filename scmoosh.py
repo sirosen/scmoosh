@@ -1,13 +1,9 @@
-#!/usr/bin/env -S -- uv run --script
-#
-# /// script
-# dependencies = ["referencing", "requests"]
-# ///
-
 import copy
 import hashlib
 import json
+import sys
 import typing as t
+import urllib.parse
 from collections import deque
 
 import referencing
@@ -29,7 +25,8 @@ class Scmoosher:
         self.new_defs_keymap: dict[str, str] = {}
 
         self.base_uri = base_uri
-        self.registry = Registry(retrieve=self._retrieve_uri)
+        # type ignore: attrs class features not recognized under 'referencing' usage
+        self.registry = Registry(retrieve=self._retrieve_uri)  # type: ignore[call-arg]
 
         self.root_contents: dict[str, t.Any] | None = None
 
@@ -49,44 +46,59 @@ class Scmoosher:
 
     def walk(self) -> None:
         resolver = self.registry.resolver()
-        self.root_contents = resolver.lookup(self.base_uri).contents
+        resolved_root = resolver.lookup(self.base_uri)
+        resolver = resolved_root.resolver
+        self.root_contents = resolved_root.contents
+
         if self.root_contents is None:
             raise ValueError("Cannot scmoosh a schema whose root is `null`!")
+
         root = Resource.from_contents(self.root_contents)
 
         # detect the specification at the root, use it throughout
-        spec = Specification.detect(self.root_contents)
+        spec = Specification[dict[str, t.Any]].detect(root.contents)
 
         # track refs we've already resolved
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
 
-        unresolved = deque((resolver, sub) for sub in root.subresources())
+        unresolved = deque([(self.base_uri, resolver, root)])
         while unresolved:
-            resolver, current = unresolved.popleft()
+            base_uri, resolver, current = unresolved.popleft()
 
             if isinstance(current.contents, dict) and isinstance(
                 ref := current.contents.get("$ref"), str
             ):
-                if ref in seen:
+                # copied out of Resolver.lookup() to let us get the exact URI which will
+                # be used
+                if ref.startswith("#"):
+                    uri, fragment = base_uri, ref[1:]
+                else:
+                    uri, fragment = urllib.parse.urldefrag(
+                        urllib.parse.urljoin(base_uri, ref)
+                    )
+                if (uri, fragment) in seen:
                     continue
+                seen.add((uri, fragment))
 
-                seen.add(ref)
                 resolved = resolver.lookup(ref)
                 new_resource = Resource.from_contents(
                     resolved.contents, default_specification=spec
                 )
-                unresolved.append((resolved.resolver, new_resource))
-
+                unresolved.append((uri, resolved.resolver, new_resource))
             else:
                 unresolved.extend(
-                    (resolver.in_subresource(sub), sub)
+                    (base_uri, resolver.in_subresource(sub), sub)
                     for sub in current.subresources()
                 )
 
     def render(self) -> dict[str, t.Any]:
         if self.root_contents is None:
             self.walk()
-        result = copy.deepcopy(self.root_contents)
+        assert self.root_contents is not None
+
+        result: dict[str, t.Any] = copy.deepcopy(self.root_contents)
+        if not self.new_defs:
+            return result
 
         # having done so, add definitions (if missing) and extend it with the new
         # scmooshed items
@@ -119,13 +131,17 @@ class Scmoosher:
         return result
 
 
-def scmooshit(base_uri: str) -> None:
+def main(argv: list[str] | None = None, /) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    base_uri = argv[0]
+
     s = Scmoosher(base_uri)
     print(s.new_defs_keymap)
     print(s.new_defs)
-    print('---')
+    print("---")
     s.walk()
-    print('---')
+    print("---")
     for k, v in s.new_defs_keymap.items():
         print(k, ":", v)
     # print(s.new_defs)
@@ -139,4 +155,4 @@ if __name__ == "__main__":
 
     for uri in data:
         print(f"smooshing {uri}")
-        scmooshit(uri)
+        main([uri])

@@ -1,0 +1,83 @@
+[dependency-groups]
+coverage = ["coverage"]
+test = ["pytest", "pytest-xdist", "responses==0.26.3", { include-group = "coverage" }]
+
+[build-system]
+requires = ["flit-core>=3.12.0"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "scmoosh"
+version = "0.1.0"
+description = 'A schema unroller for JSON Schema documents'
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = []
+authors = [
+  { name = "Stephen Rosen", email = "sirosen@globus.org" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "referencing", "requests"
+]
+import-names = ["scmoosh"]
+
+[project.urls]
+source = "https://github.com/sirosen/scmoosh"
+
+[project.scripts]
+scmoosh = "scmoosh:main"
+
+[tool.flit.sdist]
+include = ["tests/**/*.py", "tox.ini", ".flake8", "justfile"]
+exclude = [".*", "src/**/.*"]
+
+[tool.check-sdist]
+git-only = [".gitignore"]
+
+[tool.pytest.ini_options]
+addopts = "-n auto --dist worksteal"
+
+[tool.coverage.run]
+parallel = true
+patch = ["subprocess"]
+source = ["scmoosh", "tests/"]
+[tool.coverage.paths]
+source = [
+    "scmoosh.py",
+    "*/site-packages/",
+]
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    # the pragma to disable coverage
+    "pragma: no cover",
+    # don't complain if tests don't hit unimplemented methods/modes
+    "raise NotImplementedError",
+    # don't check on executable components of importable modules
+    "if __name__ == .__main__.:",
+    # mypy-only code segments
+    "if t.TYPE_CHECKING:",
+    # type-checking overloads
+    "@t.overload"
+]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+disallow_subclassing_any = false
+files = ["scmoosh.py"]
+
+[tool.isort]
+profile = "black"
