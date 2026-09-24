@@ -1,4 +1,3 @@
-import copy
 import hashlib
 import json
 import sys
@@ -9,7 +8,6 @@ from collections import deque
 import referencing
 import referencing.retrieval
 import requests
-from referencing import Registry, Resource, Specification
 
 
 @referencing.retrieval.to_cached_resource()
@@ -17,46 +15,101 @@ def _cached_retrieve_uri(uri: str) -> str:
     return requests.get(uri).text
 
 
+class ScmooshMap:
+    PREFIX = "SCMOOSHED"
+
+    def __init__(self) -> None:
+        self._map: dict[str, referencing.Resource] = {}
+        self._keymap: dict[str, str] = {}
+
+    def add(self, uri: str, resource: referencing.Resource) -> None:
+        self._map[uri] = resource
+
+        uri_hash = hashlib.md5(uri.encode()).hexdigest()
+        self._keymap[uri] = f"{self.PREFIX}:{uri_hash}"
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._map
+
+    def render(self, root_uri: str) -> dict[str, t.Any]:
+        root_key = self._keymap[root_uri]
+        root_doc = self._map[root_uri].contents
+        root_doc.pop("$id", None)
+
+        # map all definitions (including the root doc)
+        result: dict[str, t.Any] = {"definitions": {}}
+        for uri, resource in self._map.items():
+            key = self._keymap[uri]
+            result["definitions"][key] = resource.contents
+
+        # having mapped everything, traverse the object again, this time with the goal
+        # of replacing any $ref entries
+        # in the process, also strip out any `$id` values
+        to_update = deque(result["definitions"].items())
+        while to_update:
+            defn_base, doc = to_update.popleft()
+            if not isinstance(doc, (dict, list)):
+                continue
+
+            if isinstance(doc, list):
+                to_update.extend((defn_base, sub) for sub in doc)
+                continue
+
+            # dict case
+            doc.pop("$id", None)
+            if (ref := doc.get("$ref")) is not None:
+                if ref.startswith("#"):
+                    new_ref = f"#/definitions/{defn_base}/{ref[1:].lstrip('/')}"
+                else:
+                    uri, fragment = urllib.parse.urldefrag(ref)
+                    if fragment:
+                        new_ref = (
+                            f"{self._keymap[uri].rstrip('/')}/{fragment.lstrip('/')}"
+                        )
+                    else:
+                        new_ref = self._keymap[uri]
+                    new_ref = f"#/definitions/{new_ref}"
+                doc["$ref"] = new_ref
+
+            to_update.extend((defn_base, sub) for sub in doc.values())
+
+        # finally, introduce a "$ref" which points to the root doc
+        # copy "$schema" from the root if present, as it impacts how the rest of the
+        # schema evaluates
+        result["$ref"] = f"#/definitions/{root_key}"
+        if "$schema" in root_doc:
+            result["$schema"] = root_doc["$schema"]
+        return result
+
+
 class Scmoosher:
     DEFINITIONS_KEY = "SCMOOSHED"
 
     def __init__(self, base_uri: str) -> None:
-        self.new_defs: dict[str, t.Any] = {}
-        self.new_defs_keymap: dict[str, str] = {}
-
+        self.docs = ScmooshMap()
         self.base_uri = base_uri
-        # type ignore: attrs class features not recognized under 'referencing' usage
-        self.registry = Registry(retrieve=self._retrieve_uri)  # type: ignore[call-arg]
 
-        self.root_contents: dict[str, t.Any] | None = None
-
-    def _add_new_def(self, uri: str, resource: Resource) -> None:
-        if uri == self.base_uri:
-            return
-
-        uri_hash = hashlib.md5(uri.encode()).hexdigest()
-        key = f"{self.DEFINITIONS_KEY}-{uri_hash}"
-        self.new_defs[key] = resource.contents
-        self.new_defs_keymap[uri] = f"#/definitions/{key}"
-
-    def _retrieve_uri(self, uri: str) -> Resource:
+    def _retrieve_uri(self, uri: str) -> referencing.Resource:
         resource = _cached_retrieve_uri(uri)
-        self._add_new_def(uri, resource)
+        self.docs.add(uri, resource)
         return resource
 
     def walk(self) -> None:
-        resolver = self.registry.resolver()
+        # type ignore: attrs class features not recognized under 'referencing' usage
+        registry = referencing.Registry(
+            retrieve=self._retrieve_uri  # type: ignore[call-arg]
+        )
+        resolver = registry.resolver()
         resolved_root = resolver.lookup(self.base_uri)
         resolver = resolved_root.resolver
-        self.root_contents = resolved_root.contents
-
-        if self.root_contents is None:
+        root_contents = resolved_root.contents
+        if root_contents is None:
             raise ValueError("Cannot scmoosh a schema whose root is `null`!")
 
-        root = Resource.from_contents(self.root_contents)
+        root = referencing.Resource.from_contents(root_contents)
 
         # detect the specification at the root, use it throughout
-        spec = Specification[dict[str, t.Any]].detect(root.contents)
+        spec = referencing.Specification[dict[str, t.Any]].detect(root_contents)
 
         # track refs we've already resolved
         seen: set[tuple[str, str]] = set()
@@ -81,7 +134,7 @@ class Scmoosher:
                 seen.add((uri, fragment))
 
                 resolved = resolver.lookup(ref)
-                new_resource = Resource.from_contents(
+                new_resource = referencing.Resource.from_contents(
                     resolved.contents, default_specification=spec
                 )
                 unresolved.append((uri, resolved.resolver, new_resource))
@@ -92,43 +145,13 @@ class Scmoosher:
                 )
 
     def render(self) -> dict[str, t.Any]:
-        if self.root_contents is None:
-            self.walk()
-        assert self.root_contents is not None
+        return self.docs.render(self.base_uri)
 
-        result: dict[str, t.Any] = copy.deepcopy(self.root_contents)
-        if not self.new_defs:
-            return result
 
-        # having done so, add definitions (if missing) and extend it with the new
-        # scmooshed items
-        if "definitions" not in result:
-            result["definitions"] = {}
-        elif not isinstance(result["definitions"], dict):
-            raise ValueError(
-                "Cannot scmoosh a schema whose `definitions` are not an object."
-            )
-        result["definitions"].update(self.new_defs)
-
-        # finally, traverse the object again, this time with the goal of replacing any
-        # $ref entries
-        to_update = deque([result])
-        while to_update:
-            current = to_update.popleft()
-            if not isinstance(current, (dict, list)):
-                continue
-
-            if isinstance(current, list):
-                to_update.extend(current)
-                continue
-
-            # dict case
-            if (ref := current.get("$ref")) is not None:
-                if ref in self.new_defs_keymap:
-                    current["$ref"] = self.new_defs_keymap[ref]
-            to_update.extend(current.values())
-
-        return result
+def scmoosh(uri: str) -> t.Any:
+    s = Scmoosher(uri)
+    s.walk()
+    return s.render()
 
 
 def main(argv: list[str] | None = None, /) -> None:
@@ -136,23 +159,25 @@ def main(argv: list[str] | None = None, /) -> None:
         argv = sys.argv[1:]
     base_uri = argv[0]
 
-    s = Scmoosher(base_uri)
-    print(s.new_defs_keymap)
-    print(s.new_defs)
-    print("---")
-    s.walk()
-    print("---")
-    for k, v in s.new_defs_keymap.items():
-        print(k, ":", v)
-    # print(s.new_defs)
-    print("=== rendered ===")
-    print(json.dumps(s.render(), indent=2, separators=(",", ": ")))
+    print(json.dumps(scmoosh(base_uri), indent=2, separators=(",", ": ")))
 
 
 if __name__ == "__main__":
-    with open("sample_targets.txt") as fp:
-        data = [trimmed for x in fp if (trimmed := x.strip())]
+    import os
 
-    for uri in data:
-        print(f"smooshing {uri}")
-        main([uri])
+    os.makedirs("samples", exist_ok=True)
+    with open("samples/.gitignore", "w") as fp:
+        fp.write("*")
+
+    with open("sample_targets.txt") as fp:
+        data = [
+            (split[0].strip(), split[2].strip())
+            for x in fp
+            if (split := x.partition(":"))
+        ]
+
+    for name, uri in data:
+        print(f"smooshing {name} -- {uri}")
+        data = scmoosh(uri)
+        with open(f"samples/{name}.json", "w") as fp:
+            json.dump(data, fp, separators=(",", ":"))
